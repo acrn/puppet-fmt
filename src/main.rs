@@ -7,7 +7,7 @@ use std::{
 #[derive(Debug)]
 struct Arrow {
     column: usize,
-    target_resource: usize,
+    alignment_anchor: usize,
 }
 
 #[derive(Debug)]
@@ -75,11 +75,7 @@ struct Args {
         description = "replace double quotes with single quotes for raw strings"
     )]
     double_quoted_strings: bool,
-    #[argh(
-        switch,
-        short = 'r',
-        description = "fix arrow alignment in resource declarations"
-    )]
+    #[argh(switch, short = 'r', description = "fix arrow alignments")]
     arrow_alignment: bool,
     #[argh(
         switch,
@@ -125,14 +121,20 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+struct StackEntry<'a> {
+    node: tree_sitter::Node<'a>,
+    indentation: usize,
+}
+
 fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_puppet::LANGUAGE;
     parser.set_language(&lang.into())?;
     let tree = parser.parse(code, None).unwrap();
-    let mut stack: Vec<tree_sitter::Node<'_>> = Vec::new();
+    let mut stack: Vec<StackEntry> = Vec::new();
     let mut cursor = tree.walk();
     let mut eat_double_quote = false;
+    let mut last_resource_declaration = 0;
     loop {
         let node = &cursor.node();
         let node_row = node.start_position().row;
@@ -176,21 +178,63 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
             }
             eat_double_quote = !eat_double_quote;
         }
+        if node.kind() == ":" {
+            // this cannot be found for an arrow when traversing the tree, so
+            // it must be determined lexically
+            if node.parent().map(|n| n.kind()) == Some("resource_declaration") {
+                last_resource_declaration = node.start_byte();
+            }
+        }
+        if node.kind() == ";" {
+            last_resource_declaration = 0;
+        }
         if node.kind() == "=>" {
-            if let Some(resource_declaration) = node
+            // These should be aligned independently
+            //
+            // file { '/etc/dir':
+            //   ensure => directory
+            //   ;
+            //   '/etc/dir2':
+            //   ensure  => file,
+            //   content => ''
+            // }
+            let target = if node
                 .parent()
                 .and_then(|n| n.parent())
                 .take_if(|n| n.kind() == "resource_declaration")
+                .is_some()
             {
+                last_resource_declaration
+            } else {
+                // $hash0 = {
+                //   a => 1,
+                //   b => 2,
+                //   c => {
+                //     d => 5
+                //   }
+                // }
+                if let Some(hash) = stack
+                    .iter()
+                    .map(|s| s.node)
+                    .rev()
+                    .find(|n| n.kind() == "hash")
+                {
+                    hash.start_byte()
+                } else {
+                    // give up
+                    0
+                }
+            };
+            if target > 0 {
                 lines[node_row].arrow = Some(Arrow {
                     column: node.start_position().column,
-                    target_resource: resource_declaration.start_byte(),
+                    alignment_anchor: target,
                 });
             } else {
                 eprintln!(
-                    "could not find resource declaration for => at {}:{}",
-                    node.start_position().row,
-                    node.start_position().column
+                    "could not find alignment anchor for => at {}:{}",
+                    node.start_position().row + 1,
+                    node.start_position().column + 1
                 );
             }
         }
@@ -234,21 +278,55 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
             });
         }
         if lines[node_row].first_kind.is_empty() {
-            lines[node_row].first_kind = node.kind();
+            let first_kind = node.kind();
+            lines[node_row].first_kind = first_kind;
             lines[node_row].depth = stack.len();
             // '{' should indent once, but so should also '({' if on the same line
             let mut unique_indenters_by_line = rustc_hash::FxHashMap::default();
-            stack
+            let first_kind = lines[node_row].first_kind;
+            let stack_indentation = if first_kind == "}" || first_kind == ")" || first_kind == "]" {
+                &stack[..stack.len() - 1]
+            } else {
+                &stack
+            };
+            stack_indentation
                 .iter()
-                .filter(|n| !NON_INDENTERS.contains(&n.kind()))
-                .for_each(|n| {
-                    unique_indenters_by_line.insert(n.start_position().row, n);
+                .filter(|e| !NON_INDENTERS.contains(&e.node.kind()))
+                .for_each(|e| {
+                    unique_indenters_by_line.insert(e.node.start_position().row, e.indentation);
                 });
-            lines[node_row].indent = unique_indenters_by_line.len();
+            lines[node_row].indent = unique_indenters_by_line.values().copied().sum();
+        }
+        // indent an extra step if resource names are on their own lines
+        //
+        // file {
+        //   '/etc/dir':
+        //     ensure => directory,
+        //     mode   => '0755',
+        //     ;
+        //   '/etc/dir2':
+        //     ensure => directory,
+        //     mode   => '0755',
+        // }
+        if node.kind() == ":" || node.kind() == ";" {
+            if let Some(resource_name) = node.prev_sibling() {
+                if let Some(parent) = node.parent() {
+                    if parent.start_position().row != resource_name.start_position().row {
+                        let stack_amp = if node.kind() == ":" { 2 } else { 1 };
+                        stack
+                            .iter_mut()
+                            .filter(|e| e.node == parent)
+                            .for_each(|e| e.indentation = stack_amp);
+                    }
+                }
+            }
         }
         let found_child = cursor.goto_first_child();
         if found_child {
-            stack.push(*node);
+            stack.push(StackEntry {
+                node: *node,
+                indentation: 1,
+            });
         } else {
             let found_sibling = cursor.goto_next_sibling();
             if !found_sibling {
@@ -438,13 +516,7 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
             }
             // autoindent lines
             if opts.indent && line.first_kind != "string_content" {
-                let mut indent = opts.indentation * line.indent;
-                if indent > 0 && line.first_kind == "}"
-                    || line.first_kind == ")"
-                    || line.first_kind == "]"
-                {
-                    indent -= opts.indentation;
-                }
+                let indent = opts.indentation * line.indent;
                 let trimmed = line.content.trim_ascii_start();
                 if !trimmed.is_empty() && line.content.len() - trimmed.len() != indent {
                     let mut new_line = Vec::with_capacity(trimmed.len() + indent);
@@ -461,7 +533,7 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
             // batch arrows by their owning resource declarations
             if let Some(ref arrow) = line.arrow {
                 arrows_by_resource_declarations
-                    .entry(arrow.target_resource)
+                    .entry(arrow.alignment_anchor)
                     .or_insert_with(Vec::new)
                     .push(ArrowPosition {
                         row: line.row,
@@ -796,6 +868,32 @@ class test_class() {
     info("a")
   } else {
     info("b")
+  }
+}
+"#;
+        let lines = format(&mut code.as_bytes().to_vec(), opts).unwrap();
+        let mut actual = String::new();
+        lines.into_iter().for_each(|l| {
+            actual.push_str(&String::from_utf8_lossy(&l));
+            actual.push('\n')
+        });
+        assert_eq!(code, actual);
+    }
+
+    #[test]
+    fn extra_indentation() {
+        let mut opts = opts();
+        opts.indent = true;
+        let code = r#"
+class test_class() {
+  file {
+    '/etc/dir':
+      ensure => directory,
+      mode   => '0755',
+      ;
+    '/etc/dir2':
+      ensure => directory,
+      mode   => '0755',
   }
 }
 "#;
