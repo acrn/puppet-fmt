@@ -20,7 +20,6 @@ struct Spacing {
 #[derive(Debug)]
 struct Line {
     row: usize,
-    depth: usize,
     indent: usize,
     first_kind: &'static str,
     last_kind: &'static str,
@@ -121,6 +120,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct StackEntry<'a> {
     node: tree_sitter::Node<'a>,
     indentation: usize,
@@ -213,17 +213,30 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                 //     d => 5
                 //   }
                 // }
-                if let Some(hash) = stack
-                    .iter()
-                    .map(|s| s.node)
-                    .rev()
-                    .find(|n| n.kind() == "hash")
-                {
-                    hash.start_byte()
-                } else {
-                    // give up
-                    0
+
+                let mut hash_byte = 0;
+
+                // TODO: why doesn't this walk?
+                //
+                // let mut walk = node.walk();
+                // while walk.goto_parent() {
+                //     let n = walk.node();
+                //     if n.kind() == "hash" {
+                //         hash_byte = n.start_byte();
+                //         dbg![hash_byte];
+                //         break;
+                //     }
+                // }
+
+                let mut n2 = Some(*node);
+                while let Some(hash_needle) = n2 {
+                    if hash_needle.kind() == "hash" {
+                        hash_byte = hash_needle.start_byte();
+                        break;
+                    }
+                    n2 = hash_needle.parent();
                 }
+                hash_byte
             };
             if target > 0 {
                 lines[node_row].arrow = Some(Arrow {
@@ -280,12 +293,21 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
         if lines[node_row].first_kind.is_empty() {
             let first_kind = node.kind();
             lines[node_row].first_kind = first_kind;
-            lines[node_row].depth = stack.len();
             // '{' should indent once, but so should also '({' if on the same line
             let mut unique_indenters_by_line = rustc_hash::FxHashMap::default();
             let first_kind = lines[node_row].first_kind;
             let stack_indentation = if first_kind == "}" || first_kind == ")" || first_kind == "]" {
-                &stack[..stack.len() - 1]
+                // TODO: Rewrite indentation handling
+                let mut max_stack_row = 0;
+                let mut max_stack_index = 0;
+                stack.iter().enumerate().for_each(|(i, entry)| {
+                    let row = entry.node.start_position().row;
+                    if row > max_stack_row {
+                        max_stack_row = row;
+                        max_stack_index = i;
+                    }
+                });
+                &stack[..max_stack_index]
             } else {
                 &stack
             };
@@ -414,7 +436,6 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
         .map(|(row, s)| {
             let mut line = Line {
                 row,
-                depth: 0,
                 indent: 0,
                 first_kind: "",
                 last_kind: "",
@@ -894,6 +915,27 @@ class test_class() {
     '/etc/dir2':
       ensure => directory,
       mode   => '0755',
+  }
+}
+"#;
+        let lines = format(&mut code.as_bytes().to_vec(), opts).unwrap();
+        let mut actual = String::new();
+        lines.into_iter().for_each(|l| {
+            actual.push_str(&String::from_utf8_lossy(&l));
+            actual.push('\n')
+        });
+        assert_eq!(code, actual);
+    }
+    #[test]
+    fn test_hash() {
+        let mut opts = opts();
+        opts.indent = true;
+        let code = r#"
+class test_class() {
+  $h = {
+    a => {
+      b => 'c'
+    }
   }
 }
 "#;
