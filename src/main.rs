@@ -47,6 +47,7 @@ struct FormatterOptions {
 }
 
 const NON_INDENTERS: &[&str] = &[
+    "string_content",
     "source_file",
     "class_definition", // always followed by "block"
     "relation",         // ->
@@ -122,35 +123,45 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct StackEntry<'a> {
-    node: tree_sitter::Node<'a>,
-    indentation: usize,
-}
-
 fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_puppet::LANGUAGE;
     parser.set_language(&lang.into())?;
     let tree = parser.parse(code, None).unwrap();
-    let mut stack: Vec<StackEntry> = Vec::new();
     let mut cursor = tree.walk();
     let mut eat_double_quote = false;
     let mut last_resource_declaration = 0;
-    let mut last_processed_row = usize::MAX;
+    let mut indented_ranges = rustc_hash::FxHashMap::default();
+    let mut lexical_indentation: Option<[usize; 2]> = None;
     loop {
         let node = &cursor.node();
-        let node_row = node.start_position().row;
-        if node.kind() == "ERROR" {
+        let node_start_row = node.start_position().row;
+        let node_end_row = node.end_position().row;
+        let node_kind = node.kind();
+        if !NON_INDENTERS.contains(&node_kind) {
+            let block_start = node_start_row + 1;
+            let mut block_end = node_end_row;
+            let last_line = &code[node.end_byte() - node.end_position().column..node.end_byte()];
+            let last_byte = last_line[last_line.len() - 1];
+            if last_line[..last_line.len() - 1].trim_ascii().is_empty()
+                && (last_byte == b'}' || last_byte == b']' || last_byte == b')')
+            {
+                block_end -= 1;
+            }
+            if block_end >= block_start {
+                indented_ranges.insert([block_start, block_end], node.start_byte());
+            }
+        }
+        if node_kind == "ERROR" {
             // the parser doesn't support inline classes
             if code[node.byte_range()] == *b"class" {
                 cursor.goto_next_sibling();
                 eprintln!(
                     "cannot parse class, skipping {}->{}",
-                    node_row + 1,
+                    node_start_row + 1,
                     cursor.node().end_position().row + 1
                 );
-                (node_row..cursor.node().end_position().row + 1)
+                (node_start_row..cursor.node().end_position().row + 1)
                     .for_each(|row| lines[row].bypass = true);
                 if cursor.goto_next_sibling() {
                     continue;
@@ -158,11 +169,11 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
             };
             return Err(anyhow::anyhow!(
                 "parse error: {}:{}",
-                node_row + 1,
+                node_start_row + 1,
                 node.start_position().column + 1,
             ));
         }
-        if node.kind() == "\"" {
+        if node_kind == "\"" {
             if !eat_double_quote {
                 let next_node = node.next_sibling();
                 let next_next_node = next_node.and_then(|n| n.next_sibling());
@@ -170,7 +181,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                     if corresponding.kind() == "\""
                         && Some("string_content") == next_node.map(|n| n.kind())
                     {
-                        lines[node_row]
+                        lines[node_start_row]
                             .double_quotes
                             .push(node.start_position().column);
                         lines[corresponding.start_position().row]
@@ -181,17 +192,17 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
             }
             eat_double_quote = !eat_double_quote;
         }
-        if node.kind() == ":" {
+        if node_kind == ":" {
             // this cannot be found for an arrow when traversing the tree, so
             // it must be determined lexically
             if node.parent().map(|n| n.kind()) == Some("resource_declaration") {
                 last_resource_declaration = node.start_byte();
             }
         }
-        if node.kind() == ";" {
+        if node_kind == ";" {
             last_resource_declaration = 0;
         }
-        if node.kind() == "=>" {
+        if node_kind == "=>" {
             // These should be aligned independently
             //
             // file { '/etc/dir':
@@ -230,7 +241,6 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                 //         break;
                 //     }
                 // }
-
                 let mut n2 = Some(*node);
                 while let Some(hash_needle) = n2 {
                     if hash_needle.kind() == "hash" {
@@ -242,7 +252,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                 hash_byte
             };
             if target > 0 {
-                lines[node_row].arrow = Some(Arrow {
+                lines[node_start_row].arrow = Some(Arrow {
                     column: node.start_position().column,
                     alignment_anchor: target,
                 });
@@ -254,7 +264,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                 );
             }
         }
-        if node.kind() == "resource_declaration" {
+        if node_kind == "resource_declaration" {
             let identifier = node.child(0);
             let curlopen = node.child(1);
             let name = node.child(2);
@@ -287,78 +297,37 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                 });
         }
         // preserve leading and trailing whitespace in multiline strings
-        if node.kind() == "string_content" {
-            (node_row + 1..node.end_position().row + 1).for_each(|row| {
+        if node_kind == "string_content" {
+            (node_start_row + 1..node.end_position().row + 1).for_each(|row| {
                 lines[row].never_indent = true;
             });
-            (node_row..node.end_position().row).for_each(|row| {
+            (node_start_row..node.end_position().row).for_each(|row| {
                 lines[row].never_truncate = true;
             });
         }
-        if node_row != last_processed_row {
-            last_processed_row = node_row;
-            let first_kind = node.kind();
-            let mut unique_indenters_by_line = rustc_hash::FxHashMap::default();
-            let stack_indentation = if first_kind == "}" || first_kind == ")" || first_kind == "]" {
-                // TODO: Rewrite indentation handling
-                let mut max_stack_row = 0;
-                let mut max_stack_index = 0;
-                stack.iter().enumerate().for_each(|(i, entry)| {
-                    let row = entry.node.start_position().row;
-                    if row > max_stack_row {
-                        max_stack_row = row;
-                        max_stack_index = i;
-                    }
-                });
-                &stack[..max_stack_index]
-            } else {
-                &stack
-            };
-            stack_indentation
-                .iter()
-                .filter(|e| !NON_INDENTERS.contains(&e.node.kind()))
-                .for_each(|e| {
-                    unique_indenters_by_line.insert(e.node.start_position().row, e.indentation);
-                });
-            lines[node_row].indent = unique_indenters_by_line.values().copied().sum();
-        }
-        // indent an extra step if resource names are on their own lines
-        //
-        // file {
-        //   '/etc/dir':
-        //     ensure => directory,
-        //     mode   => '0755',
-        //     ;
-        //   '/etc/dir2':
-        //     ensure => directory,
-        //     mode   => '0755',
-        // }
-        if node.kind() == ":" || node.kind() == ";" {
+        if node_kind == ":" || node_kind == ";" {
             if let Some(resource_name) = node.prev_sibling() {
-                if let Some(parent) = node.parent() {
-                    if parent.start_position().row != resource_name.start_position().row {
-                        let stack_amp = if node.kind() == ":" { 2 } else { 1 };
-                        stack
-                            .iter_mut()
-                            .filter(|e| e.node == parent)
-                            .for_each(|e| e.indentation = stack_amp);
+                if let Some(resource_declaration) = node.parent() {
+                    if let Some(mut block) = lexical_indentation {
+                        block[1] = block[1].min(node_start_row - 1);
+                        indented_ranges.insert(block, resource_name.start_byte());
+                        lexical_indentation = None;
+                    }
+                    if node_kind == ":" {
+                        lexical_indentation = Some([
+                            resource_name.start_position().row + 1,
+                            resource_declaration.end_position().row - 1,
+                        ])
                     }
                 }
             }
         }
         let found_child = cursor.goto_first_child();
-        if found_child {
-            stack.push(StackEntry {
-                node: *node,
-                indentation: 1,
-            });
-        } else {
+        if !found_child {
             let found_sibling = cursor.goto_next_sibling();
             if !found_sibling {
                 let done = loop {
-                    if cursor.goto_parent() {
-                        stack.pop();
-                    } else {
+                    if !cursor.goto_parent() {
                         break true;
                     }
                     if cursor.goto_next_sibling() {
@@ -371,6 +340,22 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
             }
         }
     }
+    if let Some(block) = lexical_indentation {
+        indented_ranges.insert(block, usize::MAX);
+    }
+    let mut indentations: Vec<_> = indented_ranges.into_keys().collect();
+    indentations.sort_unstable();
+    lines
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, line)| !(line.bypass || line.never_indent || line.content.is_empty()))
+        .for_each(|(row, line)| {
+            line.indent = indentations
+                .iter()
+                .take_while(|range| range[0] <= row)
+                .filter(|range| range[1] >= row)
+                .count();
+        });
     Ok(())
 }
 
@@ -437,7 +422,6 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
         .split(|b| *b == b'\n')
         .map(|s| {
             let mut line = Line {
-                // row,
                 indent: 0,
                 content: s.to_vec(),
                 raw: Vec::new(),
@@ -914,7 +898,7 @@ class test_class() {
     '/etc/dir':
       ensure => directory,
       mode   => '0755',
-      ;
+    ;
     '/etc/dir2':
       ensure => directory,
       mode   => '0755',
