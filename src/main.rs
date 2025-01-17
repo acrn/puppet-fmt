@@ -22,7 +22,6 @@ struct Line {
     row: usize,
     indent: usize,
     first_kind: &'static str,
-    last_kind: &'static str,
     /// content bytes
     content: Vec<u8>,
     /// raw bytes to append unformatted
@@ -31,6 +30,10 @@ struct Line {
     double_quotes: Vec<usize>,
     /// inter-token spacing adjustments
     spacing: Vec<Spacing>,
+    /// never indent this line
+    never_indent: bool,
+    /// never truncate this line
+    never_truncate: bool,
     /// don't make any changes to this row
     bypass: bool,
 }
@@ -283,11 +286,13 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                     }
                 });
         }
-        lines[node_row].last_kind = node.kind();
+        // preserve leading and trailing whitespace in multiline strings
         if node.kind() == "string_content" {
             (node_row + 1..node.end_position().row + 1).for_each(|row| {
-                lines[row].first_kind = node.kind();
-                lines[row].last_kind = node.kind();
+                lines[row].never_indent = true;
+            });
+            (node_row..node.end_position().row).for_each(|row| {
+                lines[row].never_truncate = true;
             });
         }
         if lines[node_row].first_kind.is_empty() {
@@ -438,12 +443,13 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
                 row,
                 indent: 0,
                 first_kind: "",
-                last_kind: "",
                 content: s.to_vec(),
                 raw: Vec::new(),
                 arrow: None,
                 double_quotes: Vec::new(),
                 spacing: Vec::new(),
+                never_indent: false,
+                never_truncate: false,
                 bypass: false,
             };
             if let Some(identifier) = in_heredoc {
@@ -536,7 +542,7 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
                 }
             }
             // autoindent lines
-            if opts.indent && line.first_kind != "string_content" {
+            if opts.indent && !line.never_indent {
                 let indent = opts.indentation * line.indent;
                 let trimmed = line.content.trim_ascii_start();
                 if !trimmed.is_empty() && line.content.len() - trimmed.len() != indent {
@@ -563,7 +569,7 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
             };
 
             // remove trailing whitespace
-            if opts.trailing_whitespace && line.last_kind != "string_content" {
+            if opts.trailing_whitespace && !line.never_truncate {
                 line.content.truncate(line.content.trim_ascii_end().len());
             }
             line.content.extend_from_slice(&line.raw);
@@ -621,7 +627,7 @@ class test(
   String $var1 = "aoeu",
    String $var2 = "$htns",
   String $var3 = "a$htns",
- String $var4 = "\
+ String $var4 = "
    aoeu",
 ) {
 
@@ -705,7 +711,7 @@ content => template('template.erb'),
             String::from_utf8_lossy(&lines[4]),
             r#"  String $var2 = "$htns","#
         );
-        assert_eq!(String::from_utf8_lossy(&lines[6]), r#"  String $var4 = "\"#);
+        assert_eq!(String::from_utf8_lossy(&lines[6]), r#"  String $var4 = ""#);
         assert_eq!(String::from_utf8_lossy(&lines[7]), r#"   aoeu","#);
         assert_eq!(String::from_utf8_lossy(&lines[14]), r#"  }"#);
         assert_eq!(String::from_utf8_lossy(&lines[15]), r#"}"#);
