@@ -19,9 +19,8 @@ struct Spacing {
 
 #[derive(Debug)]
 struct Line {
-    row: usize,
+    /// indentation level
     indent: usize,
-    first_kind: &'static str,
     /// content bytes
     content: Vec<u8>,
     /// raw bytes to append unformatted
@@ -138,6 +137,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
     let mut cursor = tree.walk();
     let mut eat_double_quote = false;
     let mut last_resource_declaration = 0;
+    let mut last_processed_row = usize::MAX;
     loop {
         let node = &cursor.node();
         let node_row = node.start_position().row;
@@ -295,12 +295,10 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                 lines[row].never_truncate = true;
             });
         }
-        if lines[node_row].first_kind.is_empty() {
+        if node_row != last_processed_row {
+            last_processed_row = node_row;
             let first_kind = node.kind();
-            lines[node_row].first_kind = first_kind;
-            // '{' should indent once, but so should also '({' if on the same line
             let mut unique_indenters_by_line = rustc_hash::FxHashMap::default();
-            let first_kind = lines[node_row].first_kind;
             let stack_indentation = if first_kind == "}" || first_kind == ")" || first_kind == "]" {
                 // TODO: Rewrite indentation handling
                 let mut max_stack_row = 0;
@@ -437,12 +435,10 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
     let mut erase = Vec::new();
     let mut lines: Vec<_> = code
         .split(|b| *b == b'\n')
-        .enumerate()
-        .map(|(row, s)| {
+        .map(|s| {
             let mut line = Line {
-                row,
+                // row,
                 indent: 0,
-                first_kind: "",
                 content: s.to_vec(),
                 raw: Vec::new(),
                 arrow: None,
@@ -509,8 +505,9 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
     let mut arrows_by_resource_declarations = rustc_hash::FxHashMap::default();
     lines
         .iter_mut()
-        .filter(|line| !line.bypass)
-        .for_each(|line| {
+        .enumerate()
+        .filter(|(_, line)| !line.bypass)
+        .for_each(|(row_number, line)| {
             // fix double quoted non-interpolated strings
             if opts.double_quoted_strings {
                 line.double_quotes
@@ -563,7 +560,7 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
                     .entry(arrow.alignment_anchor)
                     .or_insert_with(Vec::new)
                     .push(ArrowPosition {
-                        row: line.row,
+                        row: row_number,
                         column: arrow.column,
                     });
             };
@@ -807,7 +804,7 @@ class test_class() {
 class test_class() {
   file { '/etc/file':
     ensure   => 'file',
-    content  => @("GITCONFIG"/L)
+    content2 => @("GITCONFIG"/L)
       [user]
           name = ${displayname}
           email = ${email}
@@ -824,7 +821,7 @@ class test_class() {
           default = upstream
       | GITCONFIG
     ,
-    content2 => @(GITCONFIG/L)
+    content  => @(GITCONFIG/L)
           default = upstream
       | GITCONFIG
     ,
