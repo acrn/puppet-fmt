@@ -2,6 +2,8 @@ use std::{
     fs,
     io::{self, Read, Write},
     mem,
+    os::unix::fs::PermissionsExt,
+    path,
 };
 
 #[derive(Debug)]
@@ -58,33 +60,35 @@ const NON_INDENTERS: &[&str] = &[
 #[derive(argh::FromArgs)]
 #[argh(description = "autoformatting for puppet manifests")]
 struct Args {
-    #[argh(switch, short = 'a', description = "fix all formatting")]
-    all: bool,
-    #[argh(switch, short = 'i', description = "auto-indent lines")]
-    indent: bool,
+    #[argh(switch, short = 'n', description = "don't auto-indent lines")]
+    no_indent: bool,
     #[argh(
         option,
-        short = 'n',
+        short = 'N',
         description = "number of spaces for indentation (default 2)",
         default = "2"
     )]
     indentation: usize,
-    #[argh(switch, short = 'w', description = "remove trailing whitespace")]
-    trailing_whitespace: bool,
+    #[argh(switch, short = 'w', description = "don't remove trailing whitespace")]
+    no_trailing_whitespace: bool,
     #[argh(
         switch,
         short = 't',
-        description = "replace double quotes with single quotes for raw strings"
+        description = "don't replace double quotes with single quotes for raw strings"
     )]
-    double_quoted_strings: bool,
-    #[argh(switch, short = 'r', description = "fix arrow alignments")]
-    arrow_alignment: bool,
+    no_double_quoted_strings: bool,
+    #[argh(switch, short = 'r', description = "don't fix arrow alignments")]
+    no_arrow_alignment: bool,
     #[argh(
         switch,
         short = 's',
-        description = "adjust spacing between tokens (only for resource declarations atm)"
+        description = "don't adjust spacing between tokens (only for resource declarations atm)"
     )]
-    spacing: bool,
+    no_spacing: bool,
+    #[argh(switch, short = 'i', description = "overwrite input file")]
+    in_place: bool,
+    #[argh(option, short = 'o', description = "destination filename")]
+    output: Option<String>,
     #[argh(
         positional,
         description = "manifest filename, read manifest from stdin if absent"
@@ -92,15 +96,15 @@ struct Args {
     filename: Option<String>,
 }
 
-impl From<Args> for FormatterOptions {
-    fn from(value: Args) -> Self {
+impl From<&Args> for FormatterOptions {
+    fn from(value: &Args) -> Self {
         Self {
-            indent: value.indent || value.all,
+            indent: !value.no_indent,
             indentation: value.indentation,
-            trailing_whitespace: value.trailing_whitespace || value.all,
-            double_quoted_strings: value.double_quoted_strings || value.all,
-            arrow_alignment: value.arrow_alignment || value.all,
-            spacing: value.spacing || value.all,
+            trailing_whitespace: !value.no_trailing_whitespace,
+            double_quoted_strings: !value.no_double_quoted_strings,
+            arrow_alignment: !value.no_arrow_alignment,
+            spacing: !value.no_spacing,
         }
     }
 }
@@ -108,18 +112,48 @@ impl From<Args> for FormatterOptions {
 fn main() -> anyhow::Result<()> {
     let args: Args = argh::from_env();
     let mut code = Vec::with_capacity(8192);
+    let mut permissions = None;
     if let Some(ref filename) = args.filename {
-        fs::File::open(filename)?.read_to_end(&mut code)?;
+        let mut f = fs::File::open(filename)?;
+        permissions = Some(f.metadata()?.permissions());
+        f.read_to_end(&mut code)?;
     } else {
         io::stdin().read_to_end(&mut code)?;
     }
-    let opts: FormatterOptions = args.into();
-    let fixed = format(&mut code, opts)?;
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
-    fixed.into_iter().for_each(|line| {
-        stdout.write_all(&line).unwrap();
-        stdout.write_all(b"\n").unwrap();
-    });
+    let dest_path = if args.in_place {
+        &args.filename
+    } else {
+        &args.output
+    }
+    .as_ref()
+    .map(path::Path::new);
+    let opts: FormatterOptions = (&args).into();
+    let formatted_code = format(&mut code, opts)?;
+    if let Some(dest) = dest_path {
+        let tmp = {
+            let mut builder = tempfile::Builder::new();
+            builder.permissions(permissions.unwrap_or(fs::Permissions::from_mode(0o666)));
+            if let Some(parent_dir) = dest.parent() {
+                builder.tempfile_in(parent_dir)
+            } else {
+                builder.tempfile()
+            }?
+        };
+        {
+            let mut out = io::BufWriter::new(&tmp);
+            formatted_code.into_iter().for_each(|line| {
+                out.write_all(&line).unwrap();
+                out.write_all(b"\n").unwrap();
+            });
+        }
+        tmp.persist(dest)?;
+    } else {
+        let mut stdout = io::BufWriter::new(io::stdout().lock());
+        formatted_code.into_iter().for_each(|line| {
+            stdout.write_all(&line).unwrap();
+            stdout.write_all(b"\n").unwrap();
+        });
+    }
     Ok(())
 }
 
@@ -153,7 +187,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
             }
         }
         if node_kind == "ERROR" {
-            // the parser doesn't support inline classes
+            // the parser doesn't support resource-like class declarations
             if code[node.byte_range()] == *b"class" {
                 cursor.goto_next_sibling();
                 eprintln!(
