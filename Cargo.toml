@@ -2,6 +2,9 @@
 name = "puppet-fmt"
 version = "0.1.0"
 edition = "2021"
+description = "Automatic code formatter for puppet manifests"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/acrn/puppet-fmt"
 
 [dependencies]
 anyhow = "1.0"
