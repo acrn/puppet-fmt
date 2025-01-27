@@ -237,6 +237,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
             last_resource_declaration = 0;
         }
         if node_kind == "=>" {
+            let grandparent = node.parent().and_then(|n| n.parent()).map(|n| n.kind());
             // These should be aligned independently
             //
             // file { '/etc/dir':
@@ -246,12 +247,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
             //   ensure  => file,
             //   content => ''
             // }
-            let target = if node
-                .parent()
-                .and_then(|n| n.parent())
-                .take_if(|n| n.kind() == "resource_declaration")
-                .is_some()
-            {
+            let target = if grandparent == Some("resource_declaration") {
                 last_resource_declaration
             } else {
                 // $hash0 = {
@@ -290,7 +286,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
                     column: node.start_position().column,
                     alignment_anchor: target,
                 });
-            } else {
+            } else if grandparent != Some("selector") {
                 eprintln!(
                     "could not find alignment anchor for => at {}:{}",
                     node.start_position().row + 1,
@@ -957,6 +953,27 @@ class test_class() {
     a => {
       b => 'c'
     }
+  }
+}
+"#;
+        let lines = format(&mut code.as_bytes().to_vec(), opts).unwrap();
+        let mut actual = String::new();
+        lines.into_iter().for_each(|l| {
+            actual.push_str(&String::from_utf8_lossy(&l));
+            actual.push('\n')
+        });
+        assert_eq!(code, actual);
+    }
+
+    #[test]
+    fn dont_align_selector_arrows() {
+        let mut opts = opts();
+        opts.arrow_alignment = true;
+        let code = r#"
+if $maybe {
+  $var = $prod ? {
+    true => 'option1',
+    false => 'option2',
   }
 }
 "#;
