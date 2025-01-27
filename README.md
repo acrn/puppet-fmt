@@ -29,3 +29,18 @@
     name = "puppet"
     formatter = { command = "puppet-fmt", args = [ "--indentation", "2", ] }
 
+## Sample configuration for neovim using null-ls.nvim/none-ls.nvim
+
+    local null_ls = require("null-ls")
+    local puppet_fmt = {}
+    puppet_fmt.filetypes = { "puppet" }
+    puppet_fmt.name = "puppet-fmt"
+    puppet_fmt.method = null_ls.methods.FORMATTING
+    puppet_fmt.generator = null_ls.formatter({
+        command = "puppet-fmt",
+        args = { "--indentation", "2", },
+        to_stdin = true,
+        from_stderr = true,
+    })
+    null_ls.register({ puppet_fmt })
+
