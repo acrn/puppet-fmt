@@ -1,6 +1,6 @@
 # Automatic code formatter for puppet manifests
 
-    Usage: puppet-fmt [<filename>] [-n] [-N <indentation>] [-w] [-t] [-r] [-s] [-i] [-o <output>]
+    Usage: puppet-fmt [<filename>] [-n] [-N <indentation>] [-w] [-t] [-r] [-s] [-c] [-i] [-o <output>]
 
     autoformatting for puppet manifests
 
@@ -19,6 +19,8 @@
                         don't fix arrow alignments
       -s, --no-spacing  don't adjust spacing between tokens (only for resource
                         declarations atm)
+      -c, --no-resource-like
+                        don't format resource-like class definitions
       -i, --in-place    overwrite input file
       -o, --output      destination filename
       --help, help      display usage information
@@ -27,6 +29,10 @@
 
     [[language]]
     name = "puppet"
+    scope = "source.puppet"
+    file-types = ["pp"]
+    auto-format = true
+    comment-tokens = "#"
     formatter = { command = "puppet-fmt", args = [ "--indentation", "2", ] }
 
 ## Sample configuration for neovim using null-ls.nvim/none-ls.nvim

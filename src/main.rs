@@ -46,6 +46,7 @@ struct FormatterOptions {
     double_quoted_strings: bool,
     arrow_alignment: bool,
     spacing: bool,
+    resource_like_classes: bool,
 }
 
 const NON_INDENTERS: &[&str] = &[
@@ -85,6 +86,12 @@ struct Args {
         description = "don't adjust spacing between tokens (only for resource declarations atm)"
     )]
     no_spacing: bool,
+    #[argh(
+        switch,
+        short = 'c',
+        description = "don't format resource-like class definitions"
+    )]
+    no_resource_like: bool,
     #[argh(switch, short = 'i', description = "overwrite input file")]
     in_place: bool,
     #[argh(option, short = 'o', description = "destination filename")]
@@ -105,6 +112,7 @@ impl From<&Args> for FormatterOptions {
             double_quoted_strings: !value.no_double_quoted_strings,
             arrow_alignment: !value.no_arrow_alignment,
             spacing: !value.no_spacing,
+            resource_like_classes: !value.no_resource_like,
         }
     }
 }
@@ -157,7 +165,11 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
+fn parse(
+    code: &[u8],
+    lines: &mut [Line],
+    format_resource_like_class_defs: bool,
+) -> anyhow::Result<()> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_puppet::LANGUAGE;
     parser.set_language(&lang.into())?;
@@ -167,6 +179,7 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
     let mut last_resource_declaration = 0;
     let mut indented_ranges = rustc_hash::FxHashMap::default();
     let mut lexical_indentation: Option<[usize; 2]> = None;
+    let mut ignored_error_nodes = Vec::new();
     loop {
         let node = &cursor.node();
         let node_start_row = node.start_position().row;
@@ -189,23 +202,53 @@ fn parse(code: &[u8], lines: &mut [Line]) -> anyhow::Result<()> {
         if node_kind == "ERROR" {
             // the parser doesn't support resource-like class declarations
             if code[node.byte_range()] == *b"class" {
-                cursor.goto_next_sibling();
-                eprintln!(
-                    "cannot parse class, skipping {}->{}",
-                    node_start_row + 1,
-                    cursor.node().end_position().row + 1
-                );
-                (node_start_row..cursor.node().end_position().row + 1)
-                    .for_each(|row| lines[row].bypass = true);
-                if cursor.goto_next_sibling() {
-                    continue;
+                let mut is_parseable = false;
+                if format_resource_like_class_defs {
+                    // parsing `class { 'myclass':` will result in an error
+                    // for "class", and also for "'myclass'".  Ignore both
+                    // errors and let the content be formated as a "hash".
+                    //
+                    // see https://github.com/tree-sitter-grammars/tree-sitter-puppet/issues/11
+                    let next_expected_error_node = node
+                        .next_sibling()
+                        .and_then(|n| n.child(0))
+                        .and_then(|n| n.next_sibling());
+                    if let Some(next_error) = next_expected_error_node {
+                        if next_error.kind() == "ERROR" {
+                            ignored_error_nodes.push(*node);
+                            ignored_error_nodes.push(next_error);
+                            is_parseable = true;
+                        }
+                    }
                 }
-            };
-            return Err(anyhow::anyhow!(
-                "parse error: {}:{}",
-                node_start_row + 1,
-                node.start_position().column + 1,
-            ));
+                if !is_parseable {
+                    // move past the class block and continue
+                    cursor.goto_next_sibling();
+                    eprintln!(
+                        "cannot parse class, skipping {}->{}",
+                        node_start_row + 1,
+                        cursor.node().end_position().row + 1
+                    );
+                    (node_start_row..cursor.node().end_position().row + 1)
+                        .for_each(|row| lines[row].bypass = true);
+                    if cursor.goto_next_sibling() {
+                        continue;
+                    }
+                };
+            }
+            if let Some((i, _)) = ignored_error_nodes
+                .iter()
+                .enumerate()
+                .find(|(_, n)| *n == node)
+            {
+                ignored_error_nodes.swap_remove(i);
+            } else {
+                return Err(anyhow::anyhow!(
+                    "parse error: {}:{}",
+                    node_start_row + 1,
+                    node.start_position().column + 1,
+                ));
+            }
         }
         if node_kind == "\"" {
             if !eat_double_quote {
@@ -500,7 +543,7 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
         (e[0]..e[1]).for_each(|i| code[i] = b' ');
     });
 
-    parse(code, &mut lines)?;
+    parse(code, &mut lines, opts.resource_like_classes)?;
     // remove last line if empty
     if lines
         .last()
@@ -654,6 +697,18 @@ content => template('template.erb'),
         src.as_bytes().to_vec()
     }
 
+    fn test_format_code(expected: &str, input: &str, opts: FormatterOptions) {
+        let expected_lines = expected.split('\n').map(String::from);
+        let actual_lines = format(&mut input.as_bytes().to_vec(), opts)
+            .unwrap()
+            .into_iter()
+            .map(|v| String::from_utf8_lossy(&v).to_string());
+        expected_lines
+            .zip(actual_lines)
+            .enumerate()
+            .for_each(|(i, (e, a))| assert_eq!(e, a, "line {} mismatch", i + 1));
+    }
+
     fn opts() -> FormatterOptions {
         FormatterOptions {
             indent: false,
@@ -662,6 +717,7 @@ content => template('template.erb'),
             double_quoted_strings: false,
             arrow_alignment: false,
             spacing: false,
+            resource_like_classes: false,
         }
     }
 
@@ -894,6 +950,26 @@ class test_class() {
             actual.push('\n')
         });
         assert_eq!(code, actual);
+    }
+
+    #[test]
+    fn test_resource_like_class_definition() {
+        let mut opts = opts();
+        opts.indent = true;
+        opts.arrow_alignment = true;
+        opts.resource_like_classes = true;
+        let expected = r#"
+class test_class() {
+  class { 'klass':
+    a => {
+      b => "c"
+    },
+    c => "d"
+  }
+}"#;
+
+        let mangled_code = expected.replace(" => ", "=>").replace("\n  ", "\n");
+        test_format_code(expected, &mangled_code, opts);
     }
 
     #[test]
