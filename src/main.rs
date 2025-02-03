@@ -191,17 +191,18 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
                 indented_ranges.insert([block_start, block_start], node.start_byte());
             }
             let mut block_end = node_end_row;
-            let last_line = &code[node.end_byte() - node.end_position().column..node.end_byte()];
-            if !last_line.is_empty() {
-                let last_byte = last_line[last_line.len() - 1];
-                if last_line[..last_line.len() - 1].trim_ascii().is_empty()
-                    && (last_byte == b'}' || last_byte == b']' || last_byte == b')')
-                {
+            let last_line = &code[node.end_byte() - node.end_position().column..node.end_byte()]
+                .trim_ascii_start();
+            if !last_line.is_empty() && block_end > 0 {
+                let first_byte = last_line[0];
+                if first_byte == b'}' || first_byte == b']' || first_byte == b')' {
                     block_end -= 1;
                 }
             }
             if block_end >= block_start {
-                indented_ranges.insert([block_start, block_end], node.start_byte());
+                indented_ranges
+                    .entry([block_start, block_end])
+                    .or_insert_with(|| node.start_byte());
             }
         }
         if strict && node_kind == "ERROR" {
@@ -1052,6 +1053,27 @@ function ns::func(
   Hash[String, Hash] $config,
 ) >> Array[String] {
   ['str']
+}
+"#,
+        ];
+        tests.iter().for_each(|test| {
+            let mut opts = opts();
+            opts.indent = true;
+            opts.strict = false;
+            test_format_code(test, test, opts);
+        });
+    }
+
+    #[test]
+    fn test_fold_2_indentations() {
+        let tests = [r#"
+define org::name(
+  String $version=latest,
+)
+{
+  ensure_resource('file','/etc/file.txt', {
+    content  => file('f/file.txt')
+  })
 }
 "#,
         ];
