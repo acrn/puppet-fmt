@@ -215,9 +215,16 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
         if node_kind == "\"" {
             if !eat_double_quote {
                 let next_node = node.next_sibling();
+                let contains_single_quote = match next_node {
+                    Some(c) => code[c.start_byte()..c.end_byte()]
+                        .iter()
+                        .any(|b| *b == b'\''),
+                    None => false,
+                };
                 let next_next_node = next_node.and_then(|n| n.next_sibling());
                 if let Some(corresponding) = next_next_node {
                     if corresponding.kind() == "\""
+                        && !contains_single_quote
                         && Some("string_content") == next_node.map(|n| n.kind())
                     {
                         lines[node_start_row]
@@ -1075,13 +1082,33 @@ define org::name(
     content  => file('f/file.txt')
   })
 }
-"#,
-        ];
+"#];
         tests.iter().for_each(|test| {
             let mut opts = opts();
             opts.indent = true;
             opts.strict = false;
             test_format_code(test, test, opts);
         });
+    }
+
+    #[test]
+    fn test_single_quote_in_double_quoted_string() {
+        let do_quote = r#"
+define org::name(
+  String $version="single-quote this",
+) {}
+"#;
+        let mut opt = opts();
+        opt.double_quoted_strings = true;
+        test_format_code(&do_quote.replace("\"", "'"), do_quote, opt);
+
+        let dont_quote = r#"
+define org::name(
+  String $version="don't single-quote this",
+) {}
+"#;
+        let mut opt = opts();
+        opt.double_quoted_strings = true;
+        test_format_code(dont_quote, dont_quote, opt);
     }
 }
