@@ -47,6 +47,7 @@ struct FormatterOptions {
     arrow_alignment: bool,
     spacing: bool,
     resource_like_classes: bool,
+    verbose: bool,
 }
 
 const NON_INDENTERS: &[&str] = &[
@@ -92,6 +93,8 @@ struct Args {
         description = "don't format resource-like class definitions"
     )]
     no_resource_like: bool,
+    #[argh(switch, short = 'v', description = "show diagnostic messages")]
+    verbose: bool,
     #[argh(switch, short = 'i', description = "overwrite input file")]
     in_place: bool,
     #[argh(option, short = 'o', description = "destination filename")]
@@ -113,6 +116,7 @@ impl From<&Args> for FormatterOptions {
             arrow_alignment: !value.no_arrow_alignment,
             spacing: !value.no_spacing,
             resource_like_classes: !value.no_resource_like,
+            verbose: value.verbose,
         }
     }
 }
@@ -169,6 +173,7 @@ fn parse(
     code: &[u8],
     lines: &mut [Line],
     format_resource_like_class_defs: bool,
+    verbose: bool,
 ) -> anyhow::Result<()> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_puppet::LANGUAGE;
@@ -226,11 +231,13 @@ fn parse(
                 if !is_parseable {
                     // move past the class block and continue
                     cursor.goto_next_sibling();
-                    eprintln!(
-                        "cannot parse class, skipping {}->{}",
-                        node_start_row + 1,
-                        cursor.node().end_position().row + 1
-                    );
+                    if verbose {
+                        eprintln!(
+                            "cannot parse class, skipping {}->{}",
+                            node_start_row + 1,
+                            cursor.node().end_position().row + 1
+                        );
+                    }
                     (node_start_row..cursor.node().end_position().row + 1)
                         .for_each(|row| lines[row].bypass = true);
                     if cursor.goto_next_sibling() {
@@ -331,7 +338,7 @@ fn parse(
                     column: node.start_position().column,
                     alignment_anchor: target,
                 });
-            } else if grandparent != Some("selector") {
+            } else if verbose && grandparent != Some("selector") {
                 eprintln!(
                     "could not find alignment anchor for => at {}:{}",
                     node.start_position().row + 1,
@@ -545,7 +552,7 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
         (e[0]..e[1]).for_each(|i| code[i] = b' ');
     });
 
-    parse(code, &mut lines, opts.resource_like_classes)?;
+    parse(code, &mut lines, opts.resource_like_classes, opts.verbose)?;
     // remove last line if empty
     if lines
         .last()
@@ -720,6 +727,7 @@ content => template('template.erb'),
             arrow_alignment: false,
             spacing: false,
             resource_like_classes: false,
+            verbose: true,
         }
     }
 

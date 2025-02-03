@@ -1,6 +1,6 @@
 # Automatic code formatter for puppet manifests
 
-    Usage: puppet-fmt [<filename>] [-n] [-N <indentation>] [-w] [-t] [-r] [-s] [-c] [-i] [-o <output>]
+    Usage: puppet-fmt [<filename>] [-n] [-N <indentation>] [-w] [-t] [-r] [-s] [-c] [-v] [-i] [-o <output>]
 
     autoformatting for puppet manifests
 
@@ -21,6 +21,7 @@
                         declarations atm)
       -c, --no-resource-like
                         don't format resource-like class definitions
+      -v, --verbose     show diagnostic messages
       -i, --in-place    overwrite input file
       -o, --output      destination filename
       --help, help      display usage information
