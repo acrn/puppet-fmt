@@ -189,11 +189,13 @@ fn parse(
             let block_start = node_start_row + 1;
             let mut block_end = node_end_row;
             let last_line = &code[node.end_byte() - node.end_position().column..node.end_byte()];
-            let last_byte = last_line[last_line.len() - 1];
-            if last_line[..last_line.len() - 1].trim_ascii().is_empty()
-                && (last_byte == b'}' || last_byte == b']' || last_byte == b')')
-            {
-                block_end -= 1;
+            if !last_line.is_empty() {
+                let last_byte = last_line[last_line.len() - 1];
+                if last_line[..last_line.len() - 1].trim_ascii().is_empty()
+                    && (last_byte == b'}' || last_byte == b']' || last_byte == b')')
+                {
+                    block_end -= 1;
+                }
             }
             if block_end >= block_start {
                 indented_ranges.insert([block_start, block_end], node.start_byte());
@@ -1060,5 +1062,23 @@ if $maybe {
             actual.push('\n')
         });
         assert_eq!(code, actual);
+    }
+
+    #[test]
+    fn attempt_subtract_overflow() {
+        let mut opts = opts();
+        opts.indent = true;
+        let expected = r#"
+function org::fn(Variant[String, Integer, Array] $arg) >> Variant[String, Undef] {
+  if $arg =~ Array {
+    $arg ? {
+      ['any'] => '',
+      default => sprintf('%s', 'error')
+    }
+  }
+}
+"#;
+        let mangled_code = expected.replace(" => ", "=>").replace("\n  ", "\n");
+        test_format_code(expected, &mangled_code, opts);
     }
 }
