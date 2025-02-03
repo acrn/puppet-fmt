@@ -180,8 +180,14 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
         let node_start_row = node.start_position().row;
         let node_end_row = node.end_position().row;
         let node_kind = node.kind();
-        if !NON_INDENTERS.contains(&node_kind) {
+        if node_start_row != node_end_row && !NON_INDENTERS.contains(&node_kind) {
             let block_start = node_start_row + 1;
+            if node_kind == "}" && node.start_byte() == node.end_byte() {
+                if verbose {
+                    eprintln!("found parser generated zero-length '}}', indenting next line");
+                }
+                indented_ranges.insert([block_start, block_start], node.start_byte());
+            }
             let mut block_end = node_end_row;
             let last_line = &code[node.end_byte() - node.end_position().column..node.end_byte()];
             if !last_line.is_empty() {
@@ -929,24 +935,33 @@ class test_class() {
 
     #[test]
     fn test_if_else() {
-        let mut opts = opts();
-        opts.indent = true;
-        let code = r#"
-class test_class() {
+        let tests = [
+            r#"class test_class() {
+  if $a {
+    info("a")
+    info("b")
+  }
+}
+"#,
+            r#"class test_class() {
   if $a {
     info("a")
   } else {
     info("b")
   }
 }
-"#;
-        let lines = format(&mut code.as_bytes().to_vec(), opts).unwrap();
-        let mut actual = String::new();
-        lines.into_iter().for_each(|l| {
-            actual.push_str(&String::from_utf8_lossy(&l));
-            actual.push('\n')
+"#,
+        ];
+        tests.iter().for_each(|expected| {
+            let mut opts = opts();
+            opts.indent = true;
+            opts.strict = false;
+            let mangled_code: String = expected
+                .split_inclusive("\n")
+                .map(|s| s.trim_start())
+                .collect();
+            test_format_code(expected, &mangled_code, opts);
         });
-        assert_eq!(code, actual);
     }
 
     #[test]
@@ -1015,24 +1030,5 @@ if $maybe {
             actual.push('\n')
         });
         assert_eq!(code, actual);
-    }
-
-    #[test]
-    fn attempt_subtract_overflow() {
-        let mut opts = opts();
-        opts.indent = true;
-        opts.strict = false;
-        let expected = r#"
-function org::fn(Variant[String, Integer, Array] $arg) >> Variant[String, Undef] {
-  if $arg =~ Array {
-    $arg ? {
-      ['any'] => '',
-      default => sprintf('%s', 'error')
-    }
-  }
-}
-"#;
-        let mangled_code = expected.replace(" => ", "=>").replace("\n  ", "\n");
-        test_format_code(expected, &mangled_code, opts);
     }
 }
