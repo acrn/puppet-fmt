@@ -1,6 +1,6 @@
 # Automatic code formatter for puppet manifests
 
-    Usage: puppet-fmt [<filename>] [-n] [-N <indentation>] [-w] [-t] [-r] [-s] [-c] [-v] [-i] [-o <output>]
+    Usage: puppet-fmt [<filename>] [-n] [-N <indentation>] [-w] [-t] [-r] [-s] [-S] [-v] [-i] [-o <output>]
 
     autoformatting for puppet manifests
 
@@ -19,8 +19,7 @@
                         don't fix arrow alignments
       -s, --no-spacing  don't adjust spacing between tokens (only for resource
                         declarations atm)
-      -c, --no-resource-like
-                        don't format resource-like class definitions
+      -S, --strict      abort on any parser errors
       -v, --verbose     show diagnostic messages
       -i, --in-place    overwrite input file
       -o, --output      destination filename

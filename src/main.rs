@@ -46,7 +46,7 @@ struct FormatterOptions {
     double_quoted_strings: bool,
     arrow_alignment: bool,
     spacing: bool,
-    resource_like_classes: bool,
+    strict: bool,
     verbose: bool,
 }
 
@@ -87,12 +87,8 @@ struct Args {
         description = "don't adjust spacing between tokens (only for resource declarations atm)"
     )]
     no_spacing: bool,
-    #[argh(
-        switch,
-        short = 'c',
-        description = "don't format resource-like class definitions"
-    )]
-    no_resource_like: bool,
+    #[argh(switch, short = 'S', description = "abort on any parser errors")]
+    strict: bool,
     #[argh(switch, short = 'v', description = "show diagnostic messages")]
     verbose: bool,
     #[argh(switch, short = 'i', description = "overwrite input file")]
@@ -115,7 +111,7 @@ impl From<&Args> for FormatterOptions {
             double_quoted_strings: !value.no_double_quoted_strings,
             arrow_alignment: !value.no_arrow_alignment,
             spacing: !value.no_spacing,
-            resource_like_classes: !value.no_resource_like,
+            strict: value.strict,
             verbose: value.verbose,
         }
     }
@@ -169,12 +165,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse(
-    code: &[u8],
-    lines: &mut [Line],
-    format_resource_like_class_defs: bool,
-    verbose: bool,
-) -> anyhow::Result<()> {
+fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow::Result<()> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_puppet::LANGUAGE;
     parser.set_language(&lang.into())?;
@@ -184,7 +175,6 @@ fn parse(
     let mut last_resource_declaration = 0;
     let mut indented_ranges = rustc_hash::FxHashMap::default();
     let mut lexical_indentation: Option<[usize; 2]> = None;
-    let mut ignored_error_nodes = Vec::new();
     loop {
         let node = &cursor.node();
         let node_start_row = node.start_position().row;
@@ -206,58 +196,12 @@ fn parse(
                 indented_ranges.insert([block_start, block_end], node.start_byte());
             }
         }
-        if node_kind == "ERROR" {
-            // the parser doesn't support resource-like class declarations
-            if code[node.byte_range()] == *b"class" {
-                let mut is_parseable = false;
-                if format_resource_like_class_defs {
-                    // parsing `class { 'myclass':` will result in an error
-                    // for "class", and also for "'myclass'".  Ignore both
-                    // errors and let the content be formated as a "hash".
-                    //
-                    // see https://github.com/tree-sitter-grammars/tree-sitter-puppet/issues/11
-                    let next_expected_error_node = node
-                        .next_sibling()
-                        .and_then(|n| n.child(0))
-                        .and_then(|n| n.next_sibling());
-                    if let Some(next_error) = next_expected_error_node {
-                        if next_error.kind() == "ERROR" {
-                            ignored_error_nodes.push(*node);
-                            ignored_error_nodes.push(next_error);
-                            is_parseable = true;
-                        }
-                    }
-                }
-                if !is_parseable {
-                    // move past the class block and continue
-                    cursor.goto_next_sibling();
-                    if verbose {
-                        eprintln!(
-                            "cannot parse class, skipping {}->{}",
-                            node_start_row + 1,
-                            cursor.node().end_position().row + 1
-                        );
-                    }
-                    (node_start_row..cursor.node().end_position().row + 1)
-                        .for_each(|row| lines[row].bypass = true);
-                    if cursor.goto_next_sibling() {
-                        continue;
-                    }
-                };
-            }
-            if let Some((i, _)) = ignored_error_nodes
-                .iter()
-                .enumerate()
-                .find(|(_, n)| *n == node)
-            {
-                ignored_error_nodes.swap_remove(i);
-            } else {
-                return Err(anyhow::anyhow!(
-                    "parse error: {}:{}",
-                    node_start_row + 1,
-                    node.start_position().column + 1,
-                ));
-            }
+        if strict && node_kind == "ERROR" {
+            return Err(anyhow::anyhow!(
+                "parse error: {}:{}",
+                node_start_row + 1,
+                node.start_position().column + 1,
+            ));
         }
         if node_kind == "\"" {
             if !eat_double_quote {
@@ -552,7 +496,7 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
         (e[0]..e[1]).for_each(|i| code[i] = b' ');
     });
 
-    parse(code, &mut lines, opts.resource_like_classes, opts.verbose)?;
+    parse(code, &mut lines, opts.strict, opts.verbose)?;
     // remove last line if empty
     if lines
         .last()
@@ -726,7 +670,7 @@ content => template('template.erb'),
             double_quoted_strings: false,
             arrow_alignment: false,
             spacing: false,
-            resource_like_classes: false,
+            strict: true,
             verbose: true,
         }
     }
@@ -944,6 +888,7 @@ class test_class() {
         let mut opts = opts();
         opts.spacing = true;
         opts.indent = true;
+        opts.strict = false;
         let code = r#"
 class test_class() {
   class {'klass':
@@ -967,7 +912,7 @@ class test_class() {
         let mut opts = opts();
         opts.indent = true;
         opts.arrow_alignment = true;
-        opts.resource_like_classes = true;
+        opts.strict = false;
         let expected = r#"
 class test_class() {
   class { 'klass':
@@ -1076,6 +1021,7 @@ if $maybe {
     fn attempt_subtract_overflow() {
         let mut opts = opts();
         opts.indent = true;
+        opts.strict = false;
         let expected = r#"
 function org::fn(Variant[String, Integer, Array] $arg) >> Variant[String, Undef] {
   if $arg =~ Array {
