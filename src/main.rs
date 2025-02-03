@@ -53,9 +53,11 @@ struct FormatterOptions {
 const NON_INDENTERS: &[&str] = &[
     "string_content",
     "source_file",
-    "class_definition", // always followed by "block"
-    "relation",         // ->
-    "if_statement",     // followed by "block"
+    "class_definition",      // always followed by "block"
+    "defined_resource_type", // "define" keyword
+    "function_declaration",  // "define" keyword
+    "relation",              // ->
+    "if_statement",          // followed by "block"
     "else_statement",
 ];
 
@@ -1030,5 +1032,34 @@ if $maybe {
             actual.push('\n')
         });
         assert_eq!(code, actual);
+    }
+
+    #[test]
+    fn define_and_function() {
+        let tests = [
+            // defined_resource_type
+            r#"
+define org::name(
+  String $version=latest,
+)
+{
+  $password = lookup('password, undef, undef, undef)
+}
+"#,
+            // function_declaration
+            r#"
+function ns::func(
+  Hash[String, Hash] $config,
+) >> Array[String] {
+  ['str']
+}
+"#,
+        ];
+        tests.iter().for_each(|test| {
+            let mut opts = opts();
+            opts.indent = true;
+            opts.strict = false;
+            test_format_code(test, test, opts);
+        });
     }
 }
