@@ -1,7 +1,6 @@
 use std::{
     fs,
     io::{self, Read, Write},
-    mem,
     os::unix::fs::PermissionsExt,
     path,
 };
@@ -25,8 +24,6 @@ struct Line {
     indent: usize,
     /// content bytes
     content: Vec<u8>,
-    /// raw bytes to append unformatted
-    raw: Vec<u8>,
     arrow: Option<Arrow>,
     double_quotes: Vec<usize>,
     /// inter-token spacing adjustments
@@ -51,14 +48,17 @@ struct FormatterOptions {
 }
 
 const NON_INDENTERS: &[&str] = &[
-    "string_content",
-    "source_file",
-    "class_definition",      // always followed by "block"
-    "defined_resource_type", // "define" keyword
-    "function_declaration",  // "define" keyword
-    "relation",              // ->
-    "if_statement",          // followed by "block"
-    "else_statement",
+    "manifest",
+    "class_definition",
+    "statement",
+    "resource_body",
+    "attribute_list",
+    "argument_list",
+    "define_definition",
+    "function_definition",
+    "if",
+    "else",
+    "binary",
 ];
 
 #[derive(argh::FromArgs)]
@@ -169,13 +169,19 @@ fn main() -> anyhow::Result<()> {
 
 fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow::Result<()> {
     let mut parser = tree_sitter::Parser::new();
-    let lang = tree_sitter_puppet::LANGUAGE;
-    parser.set_language(&lang.into())?;
+    parser.set_language(&tree_sitter_puppet::language())?;
     let tree = parser.parse(code, None).unwrap();
     let mut cursor = tree.walk();
-    let mut eat_double_quote = false;
     let mut last_resource_declaration = 0;
     let mut indented_ranges = rustc_hash::FxHashMap::default();
+
+    // the values of the indented_ranges hashmap aren't used, this is just something
+    // that can be helpful when trying to figure out why a line was indented
+    fn indentation_value(n: &tree_sitter::Node) -> (&'static str, [usize; 2], [usize; 2]) {
+        let start = n.start_position();
+        let end = n.end_position();
+        (n.kind(), [start.row, start.column], [end.row, end.column])
+    }
     let mut lexical_indentation: Option<[usize; 2]> = None;
     loop {
         let node = &cursor.node();
@@ -188,7 +194,7 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
                 if verbose {
                     eprintln!("found parser generated zero-length '}}', indenting next line");
                 }
-                indented_ranges.insert([block_start, block_start], node.start_byte());
+                indented_ranges.insert([block_start, block_start], indentation_value(node));
             }
             let mut block_end = node_end_row;
             let last_line = &code[node.end_byte() - node.end_position().column..node.end_byte()]
@@ -202,53 +208,49 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
             if block_end >= block_start {
                 indented_ranges
                     .entry([block_start, block_end])
-                    .or_insert_with(|| node.start_byte());
+                    .or_insert_with(|| indentation_value(node));
             }
         }
-        if strict && node_kind == "ERROR" {
-            return Err(anyhow::anyhow!(
-                "parse error: {}:{}",
-                node_start_row + 1,
-                node.start_position().column + 1,
-            ));
-        }
-        if node_kind == "\"" {
-            if !eat_double_quote {
-                let next_node = node.next_sibling();
-                let contains_single_quote = match next_node {
-                    Some(c) => code[c.start_byte()..c.end_byte()]
-                        .iter()
-                        .any(|b| *b == b'\''),
-                    None => false,
-                };
-                let next_next_node = next_node.and_then(|n| n.next_sibling());
-                if let Some(corresponding) = next_next_node {
-                    if corresponding.kind() == "\""
-                        && !contains_single_quote
-                        && Some("string_content") == next_node.map(|n| n.kind())
-                    {
-                        lines[node_start_row]
-                            .double_quotes
-                            .push(node.start_position().column);
-                        lines[corresponding.start_position().row]
-                            .double_quotes
-                            .push(corresponding.start_position().column)
-                    }
-                }
+
+        if node_kind == "ERROR" {
+            let contents = String::from_utf8_lossy(&lines[node_start_row].content);
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "parse error: {}:{}: \n{}",
+                    node_start_row + 1,
+                    node.start_position().column + 1,
+                    contents,
+                ));
             }
-            eat_double_quote = !eat_double_quote;
+            if verbose {
+                eprintln!(
+                    "failed to parse line {}:\n{}\nskipping rest of file",
+                    node_start_row + 1,
+                    contents
+                );
+            }
+            (node_start_row..lines.len()).for_each(|i| lines[i].bypass = true);
+            break;
         }
-        if node_kind == ":" {
-            // this cannot be found for an arrow when traversing the tree, so
-            // it must be determined lexically
-            if node.parent().map(|n| n.kind()) == Some("resource_declaration") {
-                last_resource_declaration = node.start_byte();
+
+        if node_kind == "double_quoted_string" {
+            let contains_single_quote = code[node.start_byte()..node.end_byte()]
+                .iter()
+                .any(|b| *b == b'\'');
+            let is_raw = node.child(0).map(|n| n.kind()) == Some("\"")
+                && node.child(1).map(|n| n.kind()) == Some("\"")
+                && node.child(2).is_none();
+            if is_raw && !contains_single_quote {
+                lines[node_start_row]
+                    .double_quotes
+                    .push(node.start_position().column);
+                lines[node_end_row]
+                    .double_quotes
+                    .push(node.end_position().column - 1);
             }
         }
-        if node_kind == ";" {
-            last_resource_declaration = 0;
-        }
-        if node_kind == "=>" {
+
+        if node_kind == "arrow" && lines[node_start_row].arrow.is_none() {
             let grandparent = node.parent().and_then(|n| n.parent()).map(|n| n.kind());
             // These should be aligned independently
             //
@@ -259,7 +261,7 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
             //   ensure  => file,
             //   content => ''
             // }
-            let target = if grandparent == Some("resource_declaration") {
+            let target = if grandparent == Some("attribute_list") {
                 last_resource_declaration
             } else {
                 // $hash0 = {
@@ -279,7 +281,6 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
                 //     let n = walk.node();
                 //     if n.kind() == "hash" {
                 //         hash_byte = n.start_byte();
-                //         dbg![hash_byte];
                 //         break;
                 //     }
                 // }
@@ -306,40 +307,48 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
                 );
             }
         }
-        if node_kind == "resource_declaration" {
+
+        // spacing adjustment
+        if node_kind == "resource_type" {
             let identifier = node.child(0);
-            let curlopen = node.child(1);
-            let name = node.child(2);
-            let colon = node.child(3);
-            let attribute = node.child(4);
-            let neighbors = [identifier, curlopen, name, colon, attribute];
-            neighbors
-                .iter()
-                .zip(neighbors.iter().skip(1))
-                .filter_map(|(a, b)| {
-                    if let Some(some_a) = a {
-                        if let Some(some_b) = b {
-                            if some_a.start_position().row == some_b.start_position().row {
-                                let space = if some_b.kind() == ":" { 0 } else { 1 };
-                                return Some((some_a, some_b, space));
-                            }
-                        }
+            let curlopen = node.child(1).filter(|n| n.kind() == "{");
+            let resource_body = node.child(2).filter(|n| n.kind() == "resource_body");
+            let resource_title = resource_body
+                .and_then(|n| n.child(0))
+                .filter(|n| n.kind() == "resource_title");
+            let colon = resource_body
+                .and_then(|n| n.child(1))
+                .filter(|n| n.kind() == ":");
+            for (left, right, spacing) in ([
+                (identifier, curlopen, 1),
+                (curlopen, resource_body, 1),
+                (resource_title, colon, 0),
+            ])
+            .iter()
+            .filter_map(|(n0, n1, s)| {
+                if let Some(m0) = n0 {
+                    if let Some(m1) = n1 {
+                        return Some((m0, m1, s));
                     }
-                    None
-                })
-                .for_each(|(a, b, space)| {
-                    let one_space = [a.end_position().column, b.start_position().column];
-                    if one_space[1] - one_space[0] != space {
-                        lines[a.start_position().row].spacing.push(Spacing {
-                            start: a.end_position().column,
-                            end: b.start_position().column,
-                            width: space,
-                        });
-                    }
-                });
+                }
+                None
+            }) {
+                let row = left.end_position().row;
+                if row == right.start_position().row {
+                    lines[row].spacing.push(Spacing {
+                        start: left.end_position().column,
+                        end: right.start_position().column,
+                        width: *spacing,
+                    });
+                }
+            }
         }
+
         // preserve leading and trailing whitespace in multiline strings
-        if node_kind == "string_content" {
+        if node_kind == "single_quoted_string"
+            || node_kind == "double_quoted_string"
+            || node_kind == "heredoc"
+        {
             (node_start_row + 1..node.end_position().row + 1).for_each(|row| {
                 lines[row].never_indent = true;
             });
@@ -347,23 +356,33 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
                 lines[row].never_truncate = true;
             });
         }
+
         if node_kind == ":" || node_kind == ";" {
             if let Some(resource_name) = node.prev_sibling() {
                 if let Some(resource_declaration) = node.parent() {
                     if let Some(mut block) = lexical_indentation {
                         block[1] = block[1].min(node_start_row - 1);
-                        indented_ranges.insert(block, resource_name.start_byte());
+                        indented_ranges.insert(block, indentation_value(&resource_name));
                         lexical_indentation = None;
                     }
                     if node_kind == ":" {
+                        // this cannot be found for an arrow when traversing the tree, so
+                        // it must be determined lexically
+                        if node.parent().map(|n| n.kind()) == Some("resource_body") {
+                            last_resource_declaration = node.start_byte();
+                        }
                         lexical_indentation = Some([
                             resource_name.start_position().row + 1,
-                            resource_declaration.end_position().row - 1,
+                            resource_declaration.end_position().row,
                         ])
+                    } else {
+                        // node_kind == ";"
+                        last_resource_declaration = 0;
                     }
                 }
             }
         }
+
         let found_child = cursor.goto_first_child();
         if !found_child {
             let found_sibling = cursor.goto_next_sibling();
@@ -382,8 +401,9 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
             }
         }
     }
+
     if let Some(block) = lexical_indentation {
-        indented_ranges.insert(block, usize::MAX);
+        indented_ranges.insert(block, ("unknown", [0, 0], [0, 0]));
     }
     let mut indentations: Vec<_> = indented_ranges.into_keys().collect();
     indentations.sort_unstable();
@@ -401,116 +421,20 @@ fn parse(code: &[u8], lines: &mut [Line], strict: bool, verbose: bool) -> anyhow
     Ok(())
 }
 
-struct HeredocStart<'a> {
-    identifier: &'a [u8],
-    left: &'a [u8],
-    right: &'a [u8],
-}
-
-fn heredoc_start(line: &[u8]) -> Option<HeredocStart> {
-    let mut split = line.rsplitn(2, |b| *b == b'@');
-    let right = split.next();
-    let left = split.next();
-    if let Some(left_of_heredoc) = left {
-        if let Some(mut heredoc_marker) = right {
-            if left_of_heredoc.contains(&b'#') {
-                return None;
-            }
-            heredoc_marker = &line[left_of_heredoc.len()..];
-            if heredoc_marker.len() < 4 {
-                return None;
-            }
-            if heredoc_marker[1] != b'(' || heredoc_marker.trim_ascii_end().last() != Some(&b')') {
-                return None;
-            }
-            let mut i0 = 2;
-            while heredoc_marker[i0] == b' ' || heredoc_marker[i0] == b'"' {
-                i0 += 1;
-            }
-            let mut i1 = i0;
-            while !(heredoc_marker[i1] == b' '
-                || heredoc_marker[i1] == b'"'
-                || heredoc_marker[i1] == b'/'
-                || heredoc_marker[i1] == b')')
-            {
-                i1 += 1;
-            }
-            return Some(HeredocStart {
-                identifier: &heredoc_marker[i0..i1],
-                left: left_of_heredoc,
-                right: heredoc_marker,
-            });
-        }
-    }
-    None
-}
-
-fn heredoc_end(line: &[u8], id: &[u8]) -> bool {
-    let trimmed = line.trim_ascii();
-    if !trimmed.starts_with(b"|") {
-        return false;
-    }
-    trimmed.ends_with(id)
-}
-
 fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut in_heredoc = None;
-    let mut offset = 0;
-    // i list of (offset, bytes) to replace in the code prior to parsing (for heredocs)
-    let mut replace = Vec::new();
-    // a list of [start, end] offsets to replace with whitespace (for heredocs)
-    let mut erase = Vec::new();
     let mut lines: Vec<_> = code
         .split(|b| *b == b'\n')
-        .map(|s| {
-            let mut line = Line {
-                indent: 0,
-                content: s.to_vec(),
-                raw: Vec::new(),
-                arrow: None,
-                double_quotes: Vec::new(),
-                spacing: Vec::new(),
-                never_indent: false,
-                never_truncate: false,
-                bypass: false,
-            };
-            if let Some(identifier) = in_heredoc {
-                if heredoc_end(&line.content, identifier) {
-                    in_heredoc = None;
-                }
-                // move line contents to raw to prevent formatting
-                mem::swap(&mut line.content, &mut line.raw);
-                // replace heredoc with whitespace prior to parsing
-                erase.push([offset, offset + s.len()]);
-            } else if let Some(heredoc) = heredoc_start(s) {
-                line.content = heredoc.left.to_vec();
-                line.raw = heredoc.right.to_vec();
-                // replace heredoc with '' and whitespace prior to parsing
-                replace.push((offset + line.content.len(), b"''"));
-                erase.push([
-                    offset + line.content.len() + 2,
-                    offset + line.content.len() + line.raw.len(),
-                ]);
-                in_heredoc = Some(heredoc.identifier)
-            }
-            offset += s.len() + 1;
-            line
+        .map(|s| Line {
+            indent: 0,
+            content: s.to_vec(),
+            arrow: None,
+            double_quotes: Vec::new(),
+            spacing: Vec::new(),
+            never_indent: false,
+            never_truncate: false,
+            bypass: false,
         })
         .collect();
-    if let Some(heredoc) = in_heredoc {
-        return Err(anyhow::anyhow!(
-            "unterminated heredoc: {}",
-            String::from_utf8_lossy(heredoc)
-        ));
-    }
-    replace.into_iter().for_each(|(offset, b)| {
-        b.iter()
-            .enumerate()
-            .for_each(|(i, b)| code[offset + i] = *b);
-    });
-    erase.into_iter().for_each(|e| {
-        (e[0]..e[1]).for_each(|i| code[i] = b' ');
-    });
 
     parse(code, &mut lines, opts.strict, opts.verbose)?;
     // remove last line if empty
@@ -595,7 +519,6 @@ fn format(code: &mut [u8], opts: FormatterOptions) -> anyhow::Result<Vec<Vec<u8>
             if opts.trailing_whitespace && !line.never_truncate {
                 line.content.truncate(line.content.trim_ascii_end().len());
             }
-            line.content.extend_from_slice(&line.raw);
         });
 
     // align arrows
@@ -671,11 +594,16 @@ content => template('template.erb'),
         let actual_lines = format(&mut input.as_bytes().to_vec(), opts)
             .unwrap()
             .into_iter()
-            .map(|v| String::from_utf8_lossy(&v).to_string());
+            .enumerate()
+            .map(|(i, v)| {
+                let line = String::from_utf8_lossy(&v).to_string();
+                eprintln!("{}: {}", i, line);
+                line
+            });
         expected_lines
             .zip(actual_lines)
             .enumerate()
-            .for_each(|(i, (e, a))| assert_eq!(e, a, "line {} mismatch", i + 1));
+            .for_each(|(i, (e, a))| assert_eq!(e, a, "line {} mismatch", i));
     }
 
     fn opts() -> FormatterOptions {
@@ -816,24 +744,6 @@ class test_class() {
     }
 
     #[test]
-    fn test_heredoc_start() {
-        let line = r#"aoeu htns => @("MY_HEREDOC"/L)"#.as_bytes();
-        let start = heredoc_start(line);
-        assert!(start.is_some());
-        let here = start.unwrap();
-        assert_eq!(here.identifier, "MY_HEREDOC".as_bytes());
-        assert_eq!(here.left, "aoeu htns => ".as_bytes());
-        assert_eq!(here.right, r#"@("MY_HEREDOC"/L)"#.as_bytes());
-    }
-
-    #[test]
-    fn test_heredoc_end() {
-        let line = r#"  | MY_HEREDOC"#.as_bytes();
-        assert!(heredoc_end(&line, &"MY_HEREDOC".as_bytes()));
-        assert!(!heredoc_end(&line, &"NOT_MY_HEREDOC".as_bytes()));
-    }
-
-    #[test]
     fn test_heredoc() {
         let mut opts = opts();
         opts.indent = true;
@@ -868,20 +778,7 @@ class test_class() {
   }
 }
 "#;
-        let lines = format(&mut code.as_bytes().to_vec(), opts).unwrap();
-        let mut actual = String::new();
-        lines.into_iter().for_each(|l| {
-            actual.push_str(&String::from_utf8_lossy(&l));
-            actual.push('\n');
-        });
-        actual
-            .split('\n')
-            .into_iter()
-            .zip(code.split('\n'))
-            .for_each(|(actual, expected)| {
-                assert_eq!(expected, actual);
-            });
-        assert_eq!(code, actual);
+        test_format_code(code, code, opts);
     }
 
     #[test]
@@ -905,22 +802,17 @@ class test_class() {
         opts.spacing = true;
         opts.indent = true;
         opts.strict = false;
+        opts.verbose = true;
         let code = r#"
 class test_class() {
-  class {'klass':
+  class { 'klass':
     a => {
       b => "c"
     }
   }
 }
 "#;
-        let lines = format(&mut code.as_bytes().to_vec(), opts).unwrap();
-        let mut actual = String::new();
-        lines.into_iter().for_each(|l| {
-            actual.push_str(&String::from_utf8_lossy(&l));
-            actual.push('\n')
-        });
-        assert_eq!(code, actual);
+        test_format_code(code, code, opts);
     }
 
     #[test]
@@ -991,14 +883,9 @@ class test_class() {
   }
 }
 "#;
-        let lines = format(&mut code.as_bytes().to_vec(), opts).unwrap();
-        let mut actual = String::new();
-        lines.into_iter().for_each(|l| {
-            actual.push_str(&String::from_utf8_lossy(&l));
-            actual.push('\n')
-        });
-        assert_eq!(code, actual);
+        test_format_code(code, code, opts);
     }
+
     #[test]
     fn test_hash() {
         let mut opts = opts();
@@ -1110,5 +997,49 @@ define org::name(
         let mut opt = opts();
         opt.double_quoted_strings = true;
         test_format_code(dont_quote, dont_quote, opt);
+
+        let also_dont_quote = r#"
+define org::name(
+  String $version="do not single-quote ${this}",
+) {}
+"#;
+        let mut opt = opts();
+        opt.double_quoted_strings = true;
+        test_format_code(also_dont_quote, also_dont_quote, opt);
+    }
+
+    #[test]
+    fn argument_list() {
+        let code = r#"
+function ns::func() {
+  $_choice = pick(
+    $facts['f0'][$f1]['opt1'],
+    $facts['f0'][$f1]['opt2'],
+    $facts['f0'][$f1]['opt3'],
+    $facts['f0'][$f1]['opt4'],
+    $facts['f0'][$f1]['opt5'],
+    '',
+  )
+}
+"#;
+        let mut opt = opts();
+        opt.indent = true;
+        test_format_code(code, code, opt);
+    }
+
+    #[test]
+    fn and_and_and() {
+        let code = r#"
+function ns::func() {
+  if a
+    and b
+    and c {
+    d
+  }
+}
+"#;
+        let mut opt = opts();
+        opt.indent = true;
+        test_format_code(code, code, opt);
     }
 }
